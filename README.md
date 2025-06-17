@@ -64,7 +64,7 @@ All endpoints expect JSON request bodies and return JSON responses.
 
 ### `POST /generate`
 
--   **Description**: Generates code or text based on a given prompt using OpenAI's chat completion.
+-   **Description**: Generates code or text based on a given prompt using OpenAI's chat completion. This endpoint internally attempts to retrieve relevant existing code snippets from the project to provide better context for code generation.
 -   **Request Body**:
     ```json
     {
@@ -83,11 +83,14 @@ All endpoints expect JSON request bodies and return JSON responses.
 
 ### `POST /index-snippet`
 
--   **Description**: Generates a vector embedding for the provided code snippet using OpenAI and stores it in the Qdrant vector database.
+-   **Description**: Indexes a code snippet for semantic search. An optional comment can be provided to enhance the contextual understanding of the code.
 -   **Request Body**:
+    *   `code: string` (Required) - The code snippet to index.
+    *   `comment: string` (Optional) - An explanatory comment for the code. If provided, it will be combined with the code during the embedding process to create a richer contextual representation.
     ```json
     {
-      "code": "Your code snippet here (e.g., function, class, block of code)"
+      "code": "Your code snippet here (e.g., function, class, block of code)",
+      "comment": "Optional: explanation of the code snippet"
     }
     ```
 -   **Response** (on success):
