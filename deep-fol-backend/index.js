@@ -2,6 +2,7 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import { OpenAI } from 'openai';
 import { QdrantClient } from 'qdrant-client';
+import { parseJavaScriptCode } from './codeParser.js';
 
 const app = express();
 const port = 3001;
@@ -17,51 +18,162 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
 const COLLECTION_NAME = 'code-snippets';
 
+// Helper function for entity extraction (basic heuristic)
+function extractPotentialEntities(prompt) {
+  const entities = [];
+  // Normalize prompt for easier regex matching.
+  const lowerPrompt = prompt.toLowerCase();
+
+  // Order of regex matters: more specific first, or handle overlaps.
+  // Method: "<className>.<methodName>"
+  const classDotMethodRegex = /([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/g;
+  let match;
+  while ((match = classDotMethodRegex.exec(lowerPrompt)) !== null) {
+    entities.push({ type: 'method', name: match[2], className: match[1] });
+  }
+
+  // Method: "method <methodName> in class <className>" or "method <methodName> on <className>"
+  const methodInClassRegex = /method\s+([a-z_][a-z0-9_]*)\s+(?:in\s+class|on)\s+([a-z_][a-z0-9_]*)/g;
+  while ((match = methodInClassRegex.exec(lowerPrompt)) !== null) {
+    entities.push({ type: 'method', name: match[1], className: match[2] });
+  }
+
+  // Class: "class <className>"
+  const classRegex = /class\s+([a-z_][a-z0-9_]*)/g;
+  while ((match = classRegex.exec(lowerPrompt)) !== null) {
+    entities.push({ type: 'class', name: match[1] });
+  }
+
+  // Function: "function <functionName>"
+  const funcRegex = /function\s+([a-z_][a-z0-9_]*)/g;
+  while ((match = funcRegex.exec(lowerPrompt)) !== null) {
+    entities.push({ type: 'function', name: match[1] });
+  }
+
+  const uniqueEntitiesMap = new Map();
+  entities.forEach(entity => {
+    const key = `${entity.type}-${entity.name}` + (entity.className ? `-${entity.className}` : '');
+    // Prioritize more specific entities (like methods over functions if name clashes implicitly by order of addition and check)
+    if (!uniqueEntitiesMap.has(key)) {
+      uniqueEntitiesMap.set(key, entity);
+    }
+  });
+
+  const finalEntities = [];
+  for (const entity of uniqueEntitiesMap.values()) {
+    if (entity.type === 'method') {
+      finalEntities.push(entity);
+    } else if (entity.type === 'class') {
+      finalEntities.push(entity);
+    } else if (entity.type === 'function') {
+      if (!finalEntities.some(e => e.name === entity.name && e.type === 'method')) {
+        finalEntities.push(entity);
+      }
+    }
+  }
+  return finalEntities.slice(0, 2); // Limit to max 2 most prominent entities
+}
+
+
 app.post('/generate', async (req, res) => {
-  const { prompt, output_format } = req.body; // 1a. Extract output_format
+  const { prompt, output_format } = req.body;
   if (!prompt) {
     return res.status(400).json({ error: 'Prompt is required.' });
   }
 
   let systemMessageContent;
-  let userMessagesContent = ""; // Initialize userMessagesContent
+  let entitySpecificContextString = "";
+  let generalSnippetsContextString = "";
+  let queryEmbedding; // Will hold the prompt embedding
 
-  // Context retrieval logic (remains the same for both output formats)
   try {
-    // 1a. Generate embedding for the prompt
+    // Generate embedding for the prompt
     const embeddingResponse = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: prompt
+      model: 'text-embedding-3-small', input: prompt
     });
-    const queryEmbedding = embeddingResponse.data[0].embedding;
+    queryEmbedding = embeddingResponse.data[0].embedding;
 
-    // 1b. Perform search in Qdrant
-    const searchResult = await qdrant.search(COLLECTION_NAME, {
-      vector: queryEmbedding,
-      limit: 2 // Fetch 2 relevant snippets
-    });
+    // --- New: Targeted Entity Context Retrieval ---
+    const potentialEntities = extractPotentialEntities(prompt);
+    if (potentialEntities.length > 0 && queryEmbedding) {
+      for (const entity of potentialEntities) {
+        try {
+          const filterConditions = [{ key: 'type', match: { value: entity.type } }];
+          // Ensure name is treated as keyword/exact match if possible by Qdrant client
+          // For this example, using 'match: { value: ... }' which implies keyword-like for strings.
+          if (entity.name) {
+            filterConditions.push({ key: 'payload.name', match: { value: entity.name } });
+          }
+          if (entity.className) {
+            filterConditions.push({ key: 'payload.className', match: { value: entity.className } });
+          }
 
-    // 1e. If Qdrant search returns snippets
-    if (searchResult && searchResult.length > 0) {
-      userMessagesContent += "Relevant existing code from the project:\n";
-      searchResult.forEach(r => {
-        userMessagesContent += "```\n" + r.payload.code + "\n```\n---\n";
-      });
+          const targetedSearchResult = await qdrant.search(COLLECTION_NAME, {
+            vector: queryEmbedding,
+            filter: { must: filterConditions },
+            limit: 1
+          });
+
+          if (targetedSearchResult && targetedSearchResult.length > 0) {
+            const foundElement = targetedSearchResult[0].payload;
+            entitySpecificContextString += `Specific context for ${foundElement.type} '${foundElement.name}' ${foundElement.className ? `in class '${foundElement.className}'` : ''} from your project:\n`;
+            entitySpecificContextString += `File: ${foundElement.filePath}\n`;
+            if (foundElement.signature) entitySpecificContextString += `Signature: ${foundElement.signature}\n`;
+            if (foundElement.summary) entitySpecificContextString += `Summary: ${foundElement.summary}\n`;
+            const snippetLines = foundElement.code_snippet.split('\n');
+            const conciseSnippet = snippetLines.slice(0, 10).join('\n') + (snippetLines.length > 10 ? "\n..." : "");
+            entitySpecificContextString += `Code (first 10 lines):\n\`\`\`\n${conciseSnippet}\n\`\`\`\n---\n`;
+          }
+        } catch (entitySearchError) {
+          console.warn(`Failed to retrieve targeted context for entity ${JSON.stringify(entity)}:`, entitySearchError.message);
+        }
+      }
+    }
+    // --- End of New: Targeted Entity Context Retrieval ---
+
+    // Perform general semantic search (existing logic)
+    if (queryEmbedding) { // Ensure we have an embedding
+        const generalSearchResult = await qdrant.search(COLLECTION_NAME, {
+        vector: queryEmbedding,
+        limit: 2
+        });
+
+        if (generalSearchResult && generalSearchResult.length > 0) {
+        generalSnippetsContextString += "General relevant code snippets from the project (semantic search):\n";
+        generalSearchResult.forEach(r => {
+            // Handle both old (/index-snippet) and new (/index-file-structures) payload structures
+            const codePayload = r.payload.code_snippet ? r.payload.code_snippet : r.payload.code;
+            const commentPayload = r.payload.comment || r.payload.summary;
+            let itemContext = "";
+            if(r.payload.filePath) itemContext += `File: ${r.payload.filePath}\n`;
+            if(r.payload.type) itemContext += `Type: ${r.payload.type} ${r.payload.name || ''}\n`;
+            if(commentPayload) itemContext += `Comment/Summary: ${commentPayload}\n`;
+
+            itemContext += "```\n" + (codePayload || JSON.stringify(r.payload)) + "\n```\n---\n";
+            generalSnippetsContextString += itemContext;
+        });
+        }
     }
   } catch (contextError) {
-    // Error handling for context retrieval
-    console.warn('Failed to retrieve contextual snippets:', contextError);
-    // userMessagesContent will remain empty if context retrieval fails, which is fine.
-    // System message will be set based on output_format later.
+    console.warn('Error during context retrieval phase:', contextError.message);
+    // Errors in context retrieval are logged as warnings, generation proceeds.
   }
 
-  // Append the original user task to userMessagesContent
+  // Construct userMessagesContent
+  let userMessagesContent = "";
+  if (entitySpecificContextString) {
+    userMessagesContent += entitySpecificContextString;
+  }
+  if (generalSnippetsContextString) {
+    userMessagesContent += generalSnippetsContextString;
+  }
   userMessagesContent += `Task: ${prompt}`;
 
   // Conditional logic based on output_format
+  // System message update to hint about structured context
   if (output_format === 'structured_edit') {
-    // 2.a.i. System message for structured edit
     systemMessageContent = `You are an AI assistant that provides code modifications in a structured JSON format.
+Context about specific functions, classes, or methods from the user's project, along with general relevant code snippets, may be provided. Use all available context.
 Respond with a JSON array containing a single action object.
 The action object must have one of the following structures:
 1. For insertions: [{"action": "insert", "line": <line_number>, "text": "<code_to_insert>"}]
@@ -69,12 +181,8 @@ The action object must have one of the following structures:
 3. For deletions: [{"action": "delete", "start_line": <start_line_number>, "end_line": <end_line_number>}]
 Ensure the line numbers are 1-based. Provide only the JSON array as your response.`;
   } else {
-    // 2.b.i. System message for plain text generation (existing logic)
-    systemMessageContent = "You are a helpful coding assistant. The user will provide a task, possibly preceded by relevant code snippets from their current project. Use this context to generate accurate and relevant code. If snippets are provided, pay close attention to their style and patterns.";
-    // If context retrieval failed earlier and userMessagesContent is empty, the above system message might be less effective.
-    // However, the prompt itself is still in userMessagesContent.
-    // Alternatively, if context failed AND userMessagesContent is JUST the prompt, a simpler system message could be used:
-    if (userMessagesContent === `Task: ${prompt}`) { // Check if only task is present (context failed)
+    systemMessageContent = "You are a helpful coding assistant. The user will provide a task. Context about specific functions, classes, or methods from their project, along with general relevant code snippets, may be provided. Use all available context to generate accurate and relevant code. If snippets or specific structures are provided, pay close attention to their style and patterns.";
+    if (!entitySpecificContextString && !generalSnippetsContextString && userMessagesContent === `Task: ${prompt}`) { // If no context at all was found
         systemMessageContent = "You are a helpful coding assistant.";
     }
   }
@@ -246,4 +354,91 @@ app.post('/semantic-search', async (req, res) => {
 
 app.listen(port, () => {
   console.log(`AI backend listening at http://localhost:${port}`);
+});
+
+// Endpoint to parse and index code structures from a file
+app.post('/index-file-structures', async (req, res) => {
+  const { filePath, content } = req.body;
+
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'filePath is required and must be a string.' });
+  }
+  if (!content || typeof content !== 'string') {
+    return res.status(400).json({ error: 'content is required and must be a string.' });
+  }
+
+  try {
+    const structures = parseJavaScriptCode(content, filePath);
+
+    if (!structures || structures.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No structures found or parsed from the file.',
+        indexed_count: 0
+      });
+    }
+
+    let indexed_count = 0;
+    const points_to_upsert = [];
+
+    for (const element of structures) {
+      let text_for_embedding = `File: ${element.filePath}\nType: ${element.type}\n`;
+      if (element.type === 'method' && element.className) {
+        text_for_embedding += `Class: ${element.className}\n`;
+      }
+      text_for_embedding += `Name: ${element.name}\n`;
+      if (element.signature) {
+        text_for_embedding += `Signature: ${element.signature}\n`;
+      }
+      if (element.summary) { // Add summary if available and concise
+        text_for_embedding += `Summary: ${element.summary}\n`;
+      }
+      text_for_embedding += `Code:\n${element.code_snippet}`;
+
+      const embeddingResponse = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: text_for_embedding,
+      });
+      const embedding = embeddingResponse.data[0].embedding;
+
+      // Construct a unique and deterministic ID if possible
+      const point_id = `${element.filePath}:${element.type}:${element.className || ''}:${element.name}:${element.start_line}`;
+
+      points_to_upsert.push({
+        id: point_id,
+        vector: embedding,
+        payload: element, // Store the full element object
+      });
+    }
+
+    if (points_to_upsert.length > 0) {
+      await qdrant.upsert(COLLECTION_NAME, { points: points_to_upsert });
+      indexed_count = points_to_upsert.length;
+    }
+
+    res.json({
+      success: true,
+      message: `Indexed ${indexed_count} structures from ${filePath}.`,
+      indexed_count: indexed_count,
+    });
+
+  } catch (error) {
+    console.error(`Error in /index-file-structures for ${filePath}:`, error);
+    if (error instanceof OpenAI.APIError) {
+      res.status(error.status || 500).json({
+        error: 'OpenAI API error during structure indexing.',
+        details: error.message || 'No additional details provided.',
+      });
+    } else if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      res.status(500).json({
+        error: 'Qdrant client error during structure indexing.',
+        details: error.message,
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to index file structures due to an internal server error.',
+        details: error.message || 'An unexpected error occurred.',
+      });
+    }
+  }
 });

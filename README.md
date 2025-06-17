@@ -65,6 +65,8 @@ All endpoints expect JSON request bodies and return JSON responses.
 ### `POST /generate`
 
 -   **Description**: Generates code or text based on a given prompt using OpenAI's chat completion. This endpoint internally attempts to retrieve relevant existing code snippets from the project to provide better context for code generation. It can return either plain text or a structured JSON object representing code edits.
+
+    This endpoint's code generation capabilities are enhanced by a deeper contextual understanding of your project. It not only uses general semantically relevant code snippets but also attempts to identify references to specific functions, classes, or methods within your prompt (if those structures have been previously indexed via `/index-file-structures`). When such specific elements are identified, their details (signatures, summaries, code) are used to provide more accurate and contextually grounded responses. This process is internal and aims to improve the quality of generated code and structured edits.
 -   **Request Body**:
     *   `prompt: string` (Required) - Your prompt describing the task or the code to generate.
     *   `output_format: string` (Optional) - Specifies the desired output format.
@@ -171,6 +173,29 @@ An **Action Object** has the following structure:
 -   **Error Responses**:
     -   `400 Bad Request`: If `code` is missing.
     -   `5xx Server Error`: For issues with OpenAI (embedding generation) or Qdrant (storage), or other internal errors. See response body for `error` and `details`.
+
+### `POST /index-file-structures`
+
+-   **Description**: Parses the content of a JavaScript file to identify and index its core structures (e.g., functions, classes, methods). This allows the AI to have a more detailed understanding of the codebase for context-aware code generation and analysis.
+-   **Request Body**:
+    ```json
+    {
+      "filePath": "path/to/your/file.js",
+      "content": "const content = 'of your JavaScript file';"
+    }
+    ```
+    - `filePath: string` (Required) - A unique identifier or path for the file.
+    - `content: string` (Required) - The complete JavaScript source code of the file.
+-   **Success Response**:
+    ```json
+    {
+      "success": true,
+      "message": "Indexed 3 structures from path/to/your/file.js.",
+      "indexed_count": 3
+    }
+    ```
+-   **Error Responses**: Standard error formats apply (e.g., `{ "error": "message", "details": "..." }`).
+-   **Note**: Indexing file structures via this endpoint enhances the `/generate` command's ability to understand prompts referring to specific code elements within the indexed files.
 
 ### `POST /semantic-search`
 
