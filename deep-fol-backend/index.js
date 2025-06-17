@@ -8,6 +8,11 @@ const port = 3001;
 
 app.use(bodyParser.json());
 
+if (!process.env.OPENAI_API_KEY) {
+  console.error('Error: OPENAI_API_KEY environment variable is not set.');
+  process.exit(1);
+}
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const qdrant = new QdrantClient({ url: 'http://localhost:6333' });
 const COLLECTION_NAME = 'code-snippets';
@@ -26,7 +31,21 @@ app.post('/generate', async (req, res) => {
     const result = completion.choices[0]?.message?.content || '';
     res.json({ result });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to generate AI response.' });
+    console.error('Error in /generate endpoint:', error);
+    if (error instanceof OpenAI.APIError) {
+      // Handle OpenAI API errors
+      const status = error.status || 500;
+      res.status(status).json({
+        error: 'OpenAI API error.',
+        details: error.message || 'No additional details provided.'
+      });
+    } else {
+      // Handle other errors
+      res.status(500).json({
+        error: 'Failed to generate AI response due to an internal server error.',
+        details: error.message || 'No additional details provided.'
+      });
+    }
   }
 });
 
@@ -53,7 +72,28 @@ app.post('/index-snippet', async (req, res) => {
     });
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to index code snippet.' });
+    console.error('Error in /index-snippet endpoint:', error);
+    if (error instanceof OpenAI.APIError) {
+      // Handle OpenAI API errors (e.g., for embeddings)
+      const status = error.status || 500;
+      res.status(status).json({
+        error: 'OpenAI API error during embedding generation.',
+        details: error.message || 'No additional details provided.'
+      });
+    } else if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      // Basic check for Qdrant related errors
+      res.status(500).json({
+        error: 'Qdrant client error during snippet indexing.',
+        details: error.message
+      });
+    }
+     else {
+      // Handle other errors
+      res.status(500).json({
+        error: 'Failed to index code snippet due to an internal server error.',
+        details: error.message || 'No additional details provided.'
+      });
+    }
   }
 });
 
@@ -78,7 +118,27 @@ app.post('/semantic-search', async (req, res) => {
     const results = searchResult.map(r => r.payload.code);
     res.json({ results });
   } catch (error) {
-    res.status(500).json({ error: 'Semantic search failed.' });
+    console.error('Error in /semantic-search endpoint:', error);
+    if (error instanceof OpenAI.APIError) {
+      // Handle OpenAI API errors (e.g., for embeddings)
+      const status = error.status || 500;
+      res.status(status).json({
+        error: 'OpenAI API error during query embedding generation.',
+        details: error.message || 'No additional details provided.'
+      });
+    } else if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      // Basic check for Qdrant related errors
+      res.status(500).json({
+        error: 'Qdrant client error during semantic search.',
+        details: error.message
+      });
+    } else {
+      // Handle other errors
+      res.status(500).json({
+        error: 'Semantic search failed due to an internal server error.',
+        details: error.message || 'No additional details provided.'
+      });
+    }
   }
 });
 
