@@ -242,6 +242,198 @@ Ensure the line numbers are 1-based. Provide only the JSON array as your respons
   }
 });
 
+app.get('/find-symbols-by-name', async (req, res) => {
+  const { name, type, limit } = req.query;
+
+  if (!name || typeof name !== 'string' || name.trim() === '') {
+    return res.status(400).json({ error: 'name query parameter is required and must be a non-empty string.' });
+  }
+
+  let validatedLimit = 10; // Default limit
+  if (limit !== undefined) {
+    const parsedLimit = parseInt(limit, 10);
+    if (isNaN(parsedLimit) || parsedLimit <= 0) {
+      // Optional: return 400 for invalid limit, or just use default. For now, using default.
+      console.warn(`Invalid limit value '${limit}' provided. Using default ${validatedLimit}.`);
+    } else {
+      validatedLimit = parsedLimit;
+    }
+  }
+
+  try {
+    let descriptiveQuery = `A code element (function, class, or method) named "${name}"`;
+    if (type && typeof type === 'string' && type.trim() !== '') {
+      descriptiveQuery = `A code ${type.trim()} named "${name}"`;
+    }
+
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: descriptiveQuery,
+    });
+    const embedding = embeddingResponse.data[0].embedding;
+
+    const qdrant_filter_conditions = [];
+    if (type && typeof type === 'string' && type.trim() !== '') {
+      qdrant_filter_conditions.push({ key: 'payload.type', match: { value: type.trim() } });
+    }
+    // Note: We are not filtering by name directly here, as the semantic search + name in query should handle it.
+    // If direct name filtering is also desired, it could be added:
+    // qdrant_filter_conditions.push({ key: 'payload.name', match: { value: name } });
+
+
+    const search_params = {
+      vector: embedding,
+      limit: validatedLimit,
+      with_payload: true,
+    };
+
+    if (qdrant_filter_conditions.length > 0) {
+      search_params.filter = { must: qdrant_filter_conditions };
+    }
+
+    const searchResult = await qdrant.search(COLLECTION_NAME, search_params);
+    const results = searchResult.map(hit => hit.payload);
+    res.json({ results });
+
+  } catch (error) {
+    console.error(`Error in /find-symbols-by-name for name "${name}":`, error);
+    if (error instanceof OpenAI.APIError) {
+      res.status(error.status || 500).json({
+        error: 'OpenAI API error during symbol search.',
+        details: error.message || 'No additional details provided.',
+      });
+    } else if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      res.status(500).json({
+        error: 'Qdrant client error during symbol search.',
+        details: error.message,
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to find symbols due to an internal server error.',
+        details: error.message || 'An unexpected error occurred.',
+      });
+    }
+  }
+});
+
+app.get('/file-outline', async (req, res) => {
+  const { filePath } = req.query;
+
+  if (!filePath || typeof filePath !== 'string') {
+    return res.status(400).json({ error: 'filePath query parameter is required.' });
+  }
+
+  try {
+    const conditions = [{ key: 'payload.filePath', match: { value: filePath } }];
+    const all_points = [];
+    let next_offset = null;
+
+    do {
+      const scrollResult = await qdrant.scroll(COLLECTION_NAME, {
+        filter: { must: conditions },
+        limit: 50, // Batch size for scrolling
+        offset: next_offset,
+        with_payload: true,
+        with_vector: false,
+      });
+
+      if (scrollResult.points && scrollResult.points.length > 0) {
+        all_points.push(...scrollResult.points);
+      }
+      next_offset = scrollResult.next_page_offset;
+    } while (next_offset);
+
+    if (all_points.length === 0) {
+      return res.json([]); // Return empty array if no structures found for the file
+    }
+
+    const outline = all_points.map(point => {
+      const payload = point.payload;
+      let summaryText = payload.summary || '';
+      if (summaryText.length > 75) {
+        summaryText = summaryText.substring(0, 75) + '...';
+      }
+      return {
+        type: payload.type,
+        name: payload.name,
+        signature: payload.signature, // May be undefined for some types like 'class' itself
+        summary: summaryText,
+        start_line: payload.start_line,
+        end_line: payload.end_line,
+        className: payload.className, // Will be undefined if not applicable
+      };
+    });
+
+    outline.sort((a, b) => (a.start_line || 0) - (b.start_line || 0));
+
+    res.json(outline);
+
+  } catch (error) {
+    console.error(`Error in /file-outline for ${filePath}:`, error);
+    if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      res.status(500).json({
+        error: 'Qdrant client error while fetching file outline.',
+        details: error.message,
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to fetch file outline due to an internal server error.',
+        details: error.message || 'An unexpected error occurred.',
+      });
+    }
+  }
+});
+
+app.get('/structure-details', async (req, res) => {
+  const { filePath, name, type, className } = req.query;
+
+  if (!filePath || !name) {
+    return res.status(400).json({ error: 'filePath and name query parameters are required.' });
+  }
+
+  try {
+    const conditions = [
+      { key: 'payload.filePath', match: { value: filePath } },
+      { key: 'payload.name', match: { value: name } },
+    ];
+
+    if (type) {
+      conditions.push({ key: 'payload.type', match: { value: type } });
+    }
+    if (className) {
+      conditions.push({ key: 'payload.className', match: { value: className } });
+    }
+
+    const scrollResult = await qdrant.scroll(COLLECTION_NAME, {
+      filter: {
+        must: conditions,
+      },
+      limit: 1,
+      with_payload: true,
+      with_vector: false, // Vector is not needed for this operation
+    });
+
+    if (scrollResult.points && scrollResult.points.length > 0) {
+      res.json(scrollResult.points[0].payload);
+    } else {
+      res.status(404).json({ error: 'Structure not found.' });
+    }
+  } catch (error) {
+    console.error('Error in /structure-details:', error);
+    if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      res.status(500).json({
+        error: 'Qdrant client error while fetching structure details.',
+        details: error.message,
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to fetch structure details due to an internal server error.',
+        details: error.message || 'An unexpected error occurred.',
+      });
+    }
+  }
+});
+
 // Endpoint to add a code snippet to the vector database
 app.post('/index-snippet', async (req, res) => {
   const { code, comment } = req.body; // 1a. Extract code and optional comment
@@ -270,7 +462,8 @@ app.post('/index-snippet', async (req, res) => {
     // 1e. Determine payload for Qdrant
     const qdrantPayload = {
       code: code,
-      comment: (comment && typeof comment === 'string' && comment.trim() !== '') ? comment.trim() : null
+      comment: (comment && typeof comment === 'string' && comment.trim() !== '') ? comment.trim() : null,
+      type: "snippet" // Add type field
     };
 
     // Store in Qdrant
@@ -309,24 +502,61 @@ app.post('/index-snippet', async (req, res) => {
 
 // Endpoint to search code snippets semantically
 app.post('/semantic-search', async (req, res) => {
-  const { query } = req.body;
-  if (!query) {
-    return res.status(400).json({ error: 'Query is required.' });
+  const { query, limit, filters } = req.body;
+
+  if (!query || typeof query !== 'string' || query.trim() === '') {
+    return res.status(400).json({ error: 'Query is required and must be a non-empty string.' });
   }
+
+  let searchLimit = 5; // Default limit
+  if (limit !== undefined) {
+    const parsedLimit = parseInt(limit, 10);
+    if (isNaN(parsedLimit) || parsedLimit <= 0) {
+      return res.status(400).json({ error: 'Limit must be a positive integer.' });
+    }
+    searchLimit = parsedLimit;
+  }
+
+  if (filters !== undefined && (typeof filters !== 'object' || filters === null)) {
+    return res.status(400).json({ error: 'Filters must be an object if provided.' });
+  }
+
   try {
     // Generate embedding for the query
     const embeddingResponse = await openai.embeddings.create({
       model: 'text-embedding-3-small',
-      input: query
+      input: query,
     });
     const embedding = embeddingResponse.data[0].embedding;
-    // Search in Qdrant
-    const searchResult = await qdrant.search(COLLECTION_NAME, {
+
+    const qdrant_filter_conditions = [];
+    if (filters) {
+      if (filters.filePath && typeof filters.filePath === 'string') {
+        qdrant_filter_conditions.push({ key: 'payload.filePath', match: { value: filters.filePath } });
+      }
+      if (filters.type && typeof filters.type === 'string') {
+        qdrant_filter_conditions.push({ key: 'payload.type', match: { value: filters.type } });
+      }
+      if (filters.name && typeof filters.name === 'string') {
+        qdrant_filter_conditions.push({ key: 'payload.name', match: { value: filters.name } });
+      }
+    }
+
+    const search_params = {
       vector: embedding,
-      limit: 3
-    });
-    const results = searchResult.map(r => r.payload.code);
+      limit: searchLimit,
+      with_payload: true, // Return full payloads
+    };
+
+    if (qdrant_filter_conditions.length > 0) {
+      search_params.filter = { must: qdrant_filter_conditions };
+    }
+
+    const searchResult = await qdrant.search(COLLECTION_NAME, search_params);
+
+    const results = searchResult.map(hit => hit.payload); // Return full payloads
     res.json({ results });
+
   } catch (error) {
     console.error('Error in /semantic-search endpoint:', error);
     if (error instanceof OpenAI.APIError) {

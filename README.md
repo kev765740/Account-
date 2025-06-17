@@ -58,6 +58,17 @@ To run this project, you will need:
 
 2.  The server will start on `http://localhost:3001` by default.
 
+## Indexed Data Types
+
+The Qdrant vector database stores different types of indexed code elements. When these elements are retrieved (e.g., via search or other endpoints), their payloads often include a `type` field to help identify what kind of code element it is. Common types include:
+
+-   `"snippet"`: A generic code snippet, typically indexed via the `/index-snippet` endpoint.
+-   `"function"`: A standalone function.
+-   `"class"`: A class definition.
+-   `"method"`: A method within a class.
+
+These types are automatically assigned during the indexing process by relevant endpoints (e.g., `/index-file-structures` for functions, classes, methods; `/index-snippet` for snippets).
+
 ## API Endpoints
 
 All endpoints expect JSON request bodies and return JSON responses.
@@ -154,7 +165,7 @@ An **Action Object** has the following structure:
 
 ### `POST /index-snippet`
 
--   **Description**: Indexes a code snippet for semantic search. An optional comment can be provided to enhance the contextual understanding of the code.
+-   **Description**: Indexes a code snippet for semantic search. An optional comment can be provided to enhance the contextual understanding of the code. Snippets indexed via this endpoint will automatically have `type: "snippet"` included in their stored Qdrant payload.
 -   **Request Body**:
     *   `code: string` (Required) - The code snippet to index.
     *   `comment: string` (Optional) - An explanatory comment for the code. If provided, it will be combined with the code during the embedding process to create a richer contextual representation.
@@ -199,23 +210,142 @@ An **Action Object** has the following structure:
 
 ### `POST /semantic-search`
 
--   **Description**: Searches for code snippets in the Qdrant database that are semantically similar to the given query.
+-   **Description**: Searches for code snippets and indexed structures in the Qdrant database that are semantically similar to the given query. Allows for optional filtering.
 -   **Request Body**:
     ```json
     {
-      "query": "Your search query here (e.g., 'function to sort an array in javascript')"
+      "query": "Your search query (e.g., 'function to sort an array in javascript')",
+      "limit": 5, // Optional, default is 5
+      "filters": { // Optional
+        "filePath": "path/to/your/file.js",
+        "type": "function", // e.g., 'function', 'class', 'method', 'snippet'
+        "name": "myFunctionName"
+      }
     }
     ```
--   **Response**:
+    - `query: string` (Required) - The natural language query for semantic search.
+    - `limit: number` (Optional) - Maximum number of results to return. Defaults to 5. Must be a positive integer.
+    - `filters: object` (Optional) - An object containing filters to apply. All filter conditions are combined with an AND logic.
+        - `filePath: string` (Optional) - Filter results by a specific file path.
+        - `type: string` (Optional) - Filter results by a specific structure type (e.g., "function", "class", "snippet").
+        - `name: string` (Optional) - Filter results by a specific structure name.
+-   **Success Response (200 OK)**:
+    Returns an array of matching items, where each item is the full payload object stored in Qdrant.
     ```json
     {
       "results": [
-        "matching_code_snippet_1",
-        "matching_code_snippet_2",
-        // ... up to 3 results
+        {
+          "filePath": "src/utils.js",
+          "type": "function",
+          "name": "sortArray",
+          "signature": "function sortArray(arr)",
+          "summary": "Sorts an array in ascending order.",
+          "code_snippet": "function sortArray(arr) {\n  return arr.sort((a, b) => a - b);\n}",
+          "className": null,
+          "start_line": 10,
+          "end_line": 12
+        },
+        // ... other matching payloads
       ]
     }
     ```
 -   **Error Responses**:
-    -   `400 Bad Request`: If `query` is missing.
-    -   `5xx Server Error`: For issues with OpenAI (query embedding) or Qdrant (search), or other internal errors. See response body for `error` and `details`.
+    -   `400 Bad Request`: If `query` is missing or invalid, or if `limit` or `filters` are malformed.
+    -   `500 Server Error`: For issues with OpenAI (embedding generation) or Qdrant (search), or other internal errors. See response body for `error` and `details`.
+
+### `GET /file-outline`
+
+-   **Method & Path**: `GET /file-outline`
+-   **Description**: Retrieves a structured outline of all indexed code elements (functions, classes, methods) for a specific file. The outline is sorted by the starting line number of each element.
+-   **Query Parameters**:
+    -   `filePath: string` (Required) - The path of the file for which to retrieve the outline (e.g., `path/to/your/file.js`).
+-   **Success Response (200 OK)**:
+    Returns a JSON array of summary objects, each representing a code structure.
+    ```json
+    [
+      {
+        "type": "function",
+        "name": "parseInput",
+        "signature": "function parseInput(data)",
+        "summary": "Parses raw input data into a structured format...", // Summaries are truncated if long
+        "start_line": 5,
+        "end_line": 15,
+        "className": null
+      },
+      {
+        "type": "class",
+        "name": "DataProcessor",
+        "signature": "class DataProcessor { ... }",
+        "summary": "Handles processing of structured data.",
+        "start_line": 18,
+        "end_line": 55,
+        "className": null
+      },
+      // ... other structures like methods within DataProcessor
+    ]
+    ```
+    If no structures are found for the file, an empty array `[]` is returned.
+-   **Error Responses**:
+    -   `400 Bad Request`: If `filePath` is missing.
+    -   `500 Server Error`: For Qdrant errors or other internal issues. Body: `{ "error": "message", "details": "..." }`.
+
+### `GET /structure-details`
+
+-   **Method & Path**: `GET /structure-details`
+-   **Description**: Fetches the complete indexed details for a specific code structure, identified by its file path, name, and optionally its type and class name.
+-   **Query Parameters**:
+    -   `filePath: string` (Required) - The file path of the structure.
+    -   `name: string` (Required) - The name of the function, class, or method.
+    -   `type: string` (Optional) - The type of the structure (e.g., "function", "class", "method"). Helps disambiguate if multiple structures share the same name in a file.
+    -   `className: string` (Optional) - If the structure is a method, this is the name of its containing class.
+-   **Success Response (200 OK)**:
+    Returns the full payload object of the found structure.
+    ```json
+    {
+      "filePath": "src/utils.js",
+      "type": "method",
+      "name": "processItem",
+      "signature": "processItem(item, options)",
+      "summary": "Processes a single item with given options.",
+      "code_snippet": "processItem(item, options) {\n  // ... method body ...\n}",
+      "className": "ItemProcessor",
+      "start_line": 25,
+      "end_line": 35
+    }
+    ```
+-   **Error Responses**:
+    -   `400 Bad Request`: If `filePath` or `name` is missing.
+    -   `404 Not Found`: If no structure matches the provided criteria. Body: `{ "error": "Structure not found." }`.
+    -   `500 Server Error`: For Qdrant errors or other internal issues. Body: `{ "error": "message", "details": "..." }`.
+
+### `GET /find-symbols-by-name`
+
+-   **Method & Path**: `GET /find-symbols-by-name`
+-   **Description**: Performs a semantic search for code symbols (functions, classes, methods) based on their name and an optional type. This endpoint is useful for finding symbols when you know their name but not necessarily their exact location or full signature. The search uses a descriptive query generated from the name and type to find semantically similar matches.
+-   **Query Parameters**:
+    -   `name: string` (Required) - The name of the symbol to search for.
+    -   `type: string` (Optional) - The type of symbol (e.g., "function", "class", "method"). If provided, the search will be filtered by this type, and the descriptive query for embedding will be more specific.
+    -   `limit: number` (Optional) - Maximum number of results to return. Defaults to 10. Must be a positive integer.
+-   **Success Response (200 OK)**:
+    Returns a JSON object containing an array of matching symbol payloads.
+    ```json
+    {
+      "results": [
+        {
+          "filePath": "src/api/auth.js",
+          "type": "function",
+          "name": "authenticateUser",
+          "signature": "async function authenticateUser(username, password)",
+          "summary": "Authenticates a user based on username and password.",
+          "code_snippet": "async function authenticateUser(username, password) { /* ... */ }",
+          "className": null,
+          "start_line": 15,
+          "end_line": 25
+        }
+        // ... other matching symbols
+      ]
+    }
+    ```
+-   **Error Responses**:
+    -   `400 Bad Request`: If `name` is missing or `limit` is invalid.
+    -   `500 Server Error`: For issues with OpenAI (embedding generation), Qdrant (search), or other internal errors. Body: `{ "error": "message", "details": "..." }`.
