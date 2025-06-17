@@ -83,8 +83,10 @@ app.post('/generate', async (req, res) => {
 
   let systemMessageContent;
   let entitySpecificContextString = "";
+  let dependencyContextString = ""; // For imports/exports
   let generalSnippetsContextString = "";
-  let queryEmbedding; // Will hold the prompt embedding
+  let queryEmbedding;
+  let relevantFilePath = null; // To store filePath of the primary found entity
 
   try {
     // Generate embedding for the prompt
@@ -93,46 +95,86 @@ app.post('/generate', async (req, res) => {
     });
     queryEmbedding = embeddingResponse.data[0].embedding;
 
-    // --- New: Targeted Entity Context Retrieval ---
+    // --- Targeted Entity Context Retrieval ---
     const potentialEntities = extractPotentialEntities(prompt);
     if (potentialEntities.length > 0 && queryEmbedding) {
-      for (const entity of potentialEntities) {
-        try {
-          const filterConditions = [{ key: 'type', match: { value: entity.type } }];
-          // Ensure name is treated as keyword/exact match if possible by Qdrant client
-          // For this example, using 'match: { value: ... }' which implies keyword-like for strings.
-          if (entity.name) {
-            filterConditions.push({ key: 'payload.name', match: { value: entity.name } });
-          }
-          if (entity.className) {
-            filterConditions.push({ key: 'payload.className', match: { value: entity.className } });
-          }
-
-          const targetedSearchResult = await qdrant.search(COLLECTION_NAME, {
-            vector: queryEmbedding,
-            filter: { must: filterConditions },
-            limit: 1
-          });
-
-          if (targetedSearchResult && targetedSearchResult.length > 0) {
-            const foundElement = targetedSearchResult[0].payload;
-            entitySpecificContextString += `Specific context for ${foundElement.type} '${foundElement.name}' ${foundElement.className ? `in class '${foundElement.className}'` : ''} from your project:\n`;
-            entitySpecificContextString += `File: ${foundElement.filePath}\n`;
-            if (foundElement.signature) entitySpecificContextString += `Signature: ${foundElement.signature}\n`;
-            if (foundElement.summary) entitySpecificContextString += `Summary: ${foundElement.summary}\n`;
-            const snippetLines = foundElement.code_snippet.split('\n');
-            const conciseSnippet = snippetLines.slice(0, 10).join('\n') + (snippetLines.length > 10 ? "\n..." : "");
-            entitySpecificContextString += `Code (first 10 lines):\n\`\`\`\n${conciseSnippet}\n\`\`\`\n---\n`;
-          }
-        } catch (entitySearchError) {
-          console.warn(`Failed to retrieve targeted context for entity ${JSON.stringify(entity)}:`, entitySearchError.message);
+      // For simplicity, focus on the first relevant entity for fetching file dependencies
+      const primaryEntity = potentialEntities[0];
+      try {
+        const filterConditions = [{ key: 'payload.type', match: { value: primaryEntity.type } }];
+        if (primaryEntity.name) {
+          filterConditions.push({ key: 'payload.name', match: { value: primaryEntity.name } });
         }
+        if (primaryEntity.className) {
+          filterConditions.push({ key: 'payload.className', match: { value: primaryEntity.className } });
+        }
+
+        const targetedSearchResult = await qdrant.search(COLLECTION_NAME, {
+          vector: queryEmbedding, // Use prompt's embedding for semantic relevance of the entity itself
+          filter: { must: filterConditions },
+          limit: 1
+        });
+
+        if (targetedSearchResult && targetedSearchResult.length > 0) {
+          const foundElement = targetedSearchResult[0].payload;
+          relevantFilePath = foundElement.filePath; // Capture filePath for dependency fetching
+
+          entitySpecificContextString += `Specific context for ${foundElement.type} '${foundElement.name}' ${foundElement.className ? `in class '${foundElement.className}'` : ''} from your project:\n`;
+          entitySpecificContextString += `File: ${foundElement.filePath}\n`;
+          if (foundElement.signature) entitySpecificContextString += `Signature: ${foundElement.signature}\n`;
+          if (foundElement.summary) entitySpecificContextString += `Summary: ${foundElement.summary}\n`;
+          const snippetLines = foundElement.code_snippet.split('\n');
+          const conciseSnippet = snippetLines.slice(0, 10).join('\n') + (snippetLines.length > 10 ? "\n..." : "");
+          entitySpecificContextString += `Code (first 10 lines):\n\`\`\`\n${conciseSnippet}\n\`\`\`\n`;
+        }
+      } catch (entitySearchError) {
+        console.warn(`Failed to retrieve targeted context for entity ${JSON.stringify(primaryEntity)}:`, entitySearchError.message);
       }
     }
-    // --- End of New: Targeted Entity Context Retrieval ---
+    // --- End of Targeted Entity Context Retrieval ---
+
+    // --- Fetch and Format Dependency Context ---
+    if (relevantFilePath) {
+      try {
+        const fileMetaFilter = {
+          must: [
+            { key: 'payload.type', match: { value: 'file_metadata' } },
+            { key: 'payload.filePath', match: { value: relevantFilePath } }
+          ]
+        };
+        const fileMetaScroll = await qdrant.scroll(COLLECTION_NAME, {
+          filter: fileMetaFilter,
+          limit: 1,
+          with_payload: true
+        });
+
+        if (fileMetaScroll.points && fileMetaScroll.points.length > 0) {
+          const fileMetaPayload = fileMetaScroll.points[0].payload;
+          let contextParts = [`\n--- File Context for: ${relevantFilePath} ---`];
+
+          if (fileMetaPayload.imports && fileMetaPayload.imports.length > 0) {
+            const importSources = [...new Set(fileMetaPayload.imports.map(imp => imp.source))].join(', ');
+            contextParts.push(`Imports sources: ${importSources || 'None'}`);
+          } else {
+            contextParts.push("Imports: None specified in metadata.");
+          }
+
+          if (fileMetaPayload.exports && fileMetaPayload.exports.length > 0) {
+            const exportNames = fileMetaPayload.exports.flatMap(exp => exp.exported_items.map(item => item.name)).join(', ');
+            contextParts.push(`Exports names: ${exportNames || 'None'}`);
+          } else {
+            contextParts.push("Exports: None specified in metadata.");
+          }
+          dependencyContextString = contextParts.join('\n') + '\n';
+        }
+      } catch (dependencyFetchError) {
+        console.warn(`Failed to retrieve dependency context for file ${relevantFilePath}:`, dependencyFetchError.message);
+      }
+    }
+    // --- End of Fetch and Format Dependency Context ---
 
     // Perform general semantic search (existing logic)
-    if (queryEmbedding) { // Ensure we have an embedding
+    if (queryEmbedding) {
         const generalSearchResult = await qdrant.search(COLLECTION_NAME, {
         vector: queryEmbedding,
         limit: 2
@@ -162,10 +204,20 @@ app.post('/generate', async (req, res) => {
   // Construct userMessagesContent
   let userMessagesContent = "";
   if (entitySpecificContextString) {
-    userMessagesContent += entitySpecificContextString;
+    userMessagesContent += entitySpecificContextString + "\n---\n";
+  }
+  if (dependencyContextString) {
+    userMessagesContent += dependencyContextString + "\n---\n";
   }
   if (generalSnippetsContextString) {
-    userMessagesContent += generalSnippetsContextString;
+    // Check if generalSnippetsContextString is not just the header
+    if (generalSnippetsContextString.trim() !== "General relevant code snippets from the project (semantic search):") {
+        userMessagesContent += generalSnippetsContextString; // Already includes "---" at the end of each snippet
+    } else if (!entitySpecificContextString && !dependencyContextString) {
+        // Avoid adding an empty general snippets section if no other context is present
+        generalSnippetsContextString = ""; // Clear it so it's not added
+    }
+    // If other contexts are present but general search is empty (just header), it's fine, don't add it.
   }
   userMessagesContent += `Task: ${prompt}`;
 
@@ -182,7 +234,7 @@ The action object must have one of the following structures:
 Ensure the line numbers are 1-based. Provide only the JSON array as your response.`;
   } else {
     systemMessageContent = "You are a helpful coding assistant. The user will provide a task. Context about specific functions, classes, or methods from their project, along with general relevant code snippets, may be provided. Use all available context to generate accurate and relevant code. If snippets or specific structures are provided, pay close attention to their style and patterns.";
-    if (!entitySpecificContextString && !generalSnippetsContextString && userMessagesContent === `Task: ${prompt}`) { // If no context at all was found
+    if (!entitySpecificContextString && !dependencyContextString && !generalSnippetsContextString.trim().replace("General relevant code snippets from the project (semantic search):","").trim() && userMessagesContent === `Task: ${prompt}`) {
         systemMessageContent = "You are a helpful coding assistant.";
     }
   }
@@ -237,6 +289,52 @@ Ensure the line numbers are 1-based. Provide only the JSON array as your respons
       res.status(500).json({
         error: 'Failed to generate AI response due to an internal server error.',
         details: error.message || 'No additional details provided.'
+      });
+    }
+  }
+});
+
+app.get('/file-dependencies', async (req, res) => {
+  const { filePath } = req.query;
+
+  if (!filePath || typeof filePath !== 'string' || filePath.trim() === '') {
+    return res.status(400).json({ error: 'filePath query parameter is required and must be a non-empty string.' });
+  }
+
+  try {
+    const conditions = [
+      { key: 'payload.type', match: { value: 'file_metadata' } },
+      { key: 'payload.filePath', match: { value: filePath } },
+    ];
+
+    const scrollResult = await qdrant.scroll(COLLECTION_NAME, {
+      filter: { must: conditions },
+      limit: 1,
+      with_payload: true,
+      with_vector: false,
+    });
+
+    if (scrollResult.points && scrollResult.points.length > 0) {
+      const payload = scrollResult.points[0].payload;
+      res.json({
+        filePath: payload.filePath,
+        imports: payload.imports || [], // Default to empty array if not present
+        exports: payload.exports || [],  // Default to empty array if not present
+      });
+    } else {
+      res.status(404).json({ error: 'File metadata not found or does not contain dependency information.' });
+    }
+  } catch (error) {
+    console.error(`Error in /file-dependencies for ${filePath}:`, error);
+    if (error.message && error.message.toLowerCase().includes('qdrant')) {
+      res.status(500).json({
+        error: 'Qdrant client error while fetching file dependencies.',
+        details: error.message,
+      });
+    } else {
+      res.status(500).json({
+        error: 'Failed to fetch file dependencies due to an internal server error.',
+        details: error.message || 'An unexpected error occurred.',
       });
     }
   }
@@ -598,19 +696,10 @@ app.post('/index-file-structures', async (req, res) => {
   }
 
   try {
-    const structures = parseJavaScriptCode(content, filePath);
-
-    if (!structures || structures.length === 0) {
-      return res.json({
-        success: true,
-        message: 'No structures found or parsed from the file.',
-        indexed_count: 0
-      });
-    }
-
-    let indexed_count = 0;
+    const { structures, imports, exports } = parseJavaScriptCode(content, filePath); // Destructure parser result
     const points_to_upsert = [];
 
+    // Process and collect structure points (existing logic)
     for (const element of structures) {
       let text_for_embedding = `File: ${element.filePath}\nType: ${element.type}\n`;
       if (element.type === 'method' && element.className) {
@@ -641,15 +730,52 @@ app.post('/index-file-structures', async (req, res) => {
       });
     }
 
+    // Create and collect file_metadata point
+    let importSources = imports.map(imp => imp.source).join(', ');
+    let exportNames = exports.flatMap(exp => exp.exported_items.map(item => item.name)).join(', ');
+
+    let text_for_file_metadata_embedding = `File: ${filePath}\n`;
+    if (imports.length > 0 && importSources) text_for_file_metadata_embedding += `Imports: ${importSources}\n`;
+    if (exports.length > 0 && exportNames) text_for_file_metadata_embedding += `Exports: ${exportNames}\n`;
+    // If the text is still just "File: filePath", add a placeholder to ensure embedding is meaningful
+    if (text_for_file_metadata_embedding === `File: ${filePath}\n`) {
+        text_for_file_metadata_embedding += "This file has no explicit imports or exports or other parsed content.";
+    }
+
+    const fileMetadataEmbeddingResponse = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: text_for_file_metadata_embedding,
+    });
+    const fileMetadataEmbedding = fileMetadataEmbeddingResponse.data[0].embedding;
+
+    const fileMetadataPayload = {
+        type: "file_metadata",
+        filePath: filePath,
+        imports: imports, // Store full import objects
+        exports: exports, // Store full export objects
+        summary: null, // Placeholder for potential future file-level summary
+        line_count: content.split('\n').length,
+        structure_count: structures.length, // Count of functions, classes, methods
+        import_count: imports.length,
+        export_count: exports.length
+    };
+
+    const file_metadata_point_id = `filemeta:${filePath}`;
+    points_to_upsert.push({
+        id: file_metadata_point_id,
+        vector: fileMetadataEmbedding,
+        payload: fileMetadataPayload
+    });
+
+    // Batch Upsert (includes structures and the file_metadata point)
     if (points_to_upsert.length > 0) {
       await qdrant.upsert(COLLECTION_NAME, { points: points_to_upsert });
-      indexed_count = points_to_upsert.length;
     }
 
     res.json({
       success: true,
-      message: `Indexed ${indexed_count} structures from ${filePath}.`,
-      indexed_count: indexed_count,
+      message: `Successfully indexed ${structures.length} structures and file metadata for ${filePath}.`,
+      indexed_count: points_to_upsert.length, // Total points upserted
     });
 
   } catch (error) {

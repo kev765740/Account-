@@ -91,14 +91,227 @@ const FUNCTION_REGEX = /(?:\s*\/\*\*([\s\S]*?)\*\/\s*|\s*((?:\/\/[^\r\n]*\r?\n)+
 const METHOD_REGEX = /(?:\s*\/\*\*([\s\S]*?)\*\/\s*|\s*((?:\/\/[^\r\n]*\r?\n)+))?^\s*(static\s+)?(async\s+|get\s+|set\s+)?(\*?\s*[A-Za-z_][A-Za-z0-9_]*|constructor)\s*\(([^)]*)\)\s*\{/gm;
 
 
+// --- Import/Export Parsing Regexes ---
+// Import default: import defaultName from 'source';
+const IMPORT_DEFAULT_REGEX = /^\s*import\s+([A-Za-z_][A-Za-z0-9_$]*)\s+from\s+(['"])(.+?)\2\s*;?/gm;
+// Import namespace: import * as namespaceName from 'source';
+const IMPORT_NAMESPACE_REGEX = /^\s*import\s+\*\s+as\s+([A-Za-z_][A-Za-z0-9_$]*)\s+from\s+(['"])(.+?)\2\s*;?/gm;
+// Import named: import { member1, member2 as alias2 } from 'source';
+const IMPORT_NAMED_REGEX = /^\s*import\s+\{([^}]+)\}\s+from\s+(['"])(.+?)\2\s*;?/gm;
+// Import side effect: import 'source';
+const IMPORT_SIDE_EFFECT_REGEX = /^\s*import\s+(['"])(.+?)\1\s*;?/gm;
+
+// Export default identifier: export default identifier;
+const EXPORT_DEFAULT_IDENTIFIER_REGEX = /^\s*export\s+default\s+([A-Za-z_][A-Za-z0-9_$]*)\s*;?/gm;
+// Export default expression (simplified, captures start of function/class or general expression)
+const EXPORT_DEFAULT_EXPRESSION_REGEX = /^\s*export\s+default\s+(function(?:\s+[A-Za-z_][A-Za-z0-9_$]*)?\(|class(?:\s+[A-Za-z_][A-Za-z0-9_$]*)?\{|new\s+|[a-zA-Z_$][\w$]*\(|[{(["'`])\s*;?/gm;
+// Export declaration: export const/let/var/function/class Name ...
+const EXPORT_DECLARATION_REGEX = /^\s*export\s+(?:async\s+)?(const|let|var|function|class)\s+([A-Za-z_][A-Za-z0-9_$]*)/gm;
+// Export named list: export { name1, name2 as alias }; or export { name1 } from 'source';
+const EXPORT_NAMED_LIST_REGEX = /^\s*export\s+\{([^}]+)\}\s*(?:from\s+(['"])(.+?)\2)?\s*;?/gm;
+// Export all from source: export * from 'source';
+const EXPORT_ALL_FROM_REGEX = /^\s*export\s+\*\s+from\s+(['"])(.+?)\1\s*;?/gm;
+
+
+/**
+ * Parses import specifiers from a string like "member1, member2 as alias2".
+ * @param {string} specifierString The string content between curly braces {}.
+ * @returns {Array<Object>} Array of specifier objects.
+ */
+function parseImportSpecifiers(specifierString) {
+  const specifiers = [];
+  if (!specifierString || specifierString.trim() === "") return specifiers;
+  specifierString.split(',').forEach(part => {
+    const trimmedPart = part.trim();
+    if (trimmedPart) {
+      const aliasMatch = trimmedPart.match(/^([A-Za-z_][A-Za-z0-9_$]*)\s+as\s+([A-Za-z_][A-Za-z0-9_$]*)$/);
+      if (aliasMatch) {
+        specifiers.push({ type: "named", imported: aliasMatch[1], local: aliasMatch[2] });
+      } else {
+        specifiers.push({ type: "named", imported: trimmedPart, local: trimmedPart });
+      }
+    }
+  });
+  return specifiers;
+}
+
+/**
+ * Parses export specifiers from a string like "name1, name2 as alias".
+ * @param {string} specifierString The string content between curly braces {}.
+ * @returns {Array<Object>} Array of specifier objects.
+ */
+function parseExportSpecifiers(specifierString) {
+  const specifiers = [];
+   if (!specifierString || specifierString.trim() === "") return specifiers;
+  specifierString.split(',').forEach(part => {
+    const trimmedPart = part.trim();
+    if (trimmedPart) {
+      const aliasMatch = trimmedPart.match(/^([A-Za-z_][A-Za-z0-9_$]*)\s+as\s+([A-Za-z_][A-Za-z0-9_$]*)$/);
+      if (aliasMatch) {
+        specifiers.push({ name: aliasMatch[2], local: aliasMatch[1] });
+      } else {
+        specifiers.push({ name: trimmedPart, local: trimmedPart });
+      }
+    }
+  });
+  return specifiers;
+}
+
+
 export function parseJavaScriptCode(fileContent, filePath) {
-  const elements = [];
+  const structures = [];
+  const imports = [];
+  const exports = [];
   let match;
 
   // Reset regex state for each call
   CLASS_REGEX.lastIndex = 0;
   FUNCTION_REGEX.lastIndex = 0;
   METHOD_REGEX.lastIndex = 0;
+  IMPORT_DEFAULT_REGEX.lastIndex = 0;
+  IMPORT_NAMESPACE_REGEX.lastIndex = 0;
+  IMPORT_NAMED_REGEX.lastIndex = 0;
+  IMPORT_SIDE_EFFECT_REGEX.lastIndex = 0;
+  EXPORT_DEFAULT_IDENTIFIER_REGEX.lastIndex = 0;
+  EXPORT_DEFAULT_EXPRESSION_REGEX.lastIndex = 0;
+  EXPORT_DECLARATION_REGEX.lastIndex = 0;
+  EXPORT_NAMED_LIST_REGEX.lastIndex = 0;
+  EXPORT_ALL_FROM_REGEX.lastIndex = 0;
+
+  // --- Parse Imports ---
+  while ((match = IMPORT_DEFAULT_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    imports.push({
+      raw: match[0],
+      source: match[3],
+      specifiers: [{ type: "default", local: match[1] }],
+      start_line: startLine, end_line: endLine, filePath
+    });
+  }
+  while ((match = IMPORT_NAMESPACE_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    imports.push({
+      raw: match[0],
+      source: match[3],
+      specifiers: [{ type: "namespace", local: match[1] }],
+      start_line: startLine, end_line: endLine, filePath
+    });
+  }
+  while ((match = IMPORT_NAMED_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    imports.push({
+      raw: match[0],
+      source: match[3],
+      specifiers: parseImportSpecifiers(match[1]),
+      start_line: startLine, end_line: endLine, filePath
+    });
+  }
+  while ((match = IMPORT_SIDE_EFFECT_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    imports.push({
+      raw: match[0],
+      source: match[2],
+      specifiers: [{ type: "side-effect" }],
+      start_line: startLine, end_line: endLine, filePath
+    });
+  }
+
+  // --- Parse Exports ---
+  while ((match = EXPORT_DEFAULT_IDENTIFIER_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    exports.push({
+      raw: match[0], type: "default",
+      exported_items: [{ name: "default", local: match[1] }],
+      source: null, start_line: startLine, end_line: endLine, filePath
+    });
+  }
+  // EXPORT_DEFAULT_EXPRESSION_REGEX is tricky, often better to rely on raw for complex cases
+  // For now, we'll primarily use it to mark that a default export expression exists.
+  // A more sophisticated approach might try to determine if it's an anonymous func/class.
+  while ((match = EXPORT_DEFAULT_EXPRESSION_REGEX.exec(fileContent)) !== null) {
+      // Avoid double counting if EXPORT_DEFAULT_IDENTIFIER_REGEX already matched (e.g. export default foo;)
+      if (exports.some(e => e.raw.startsWith(match[0].substring(0, Math.min(match[0].length, 20))))) continue;
+
+      const startLine = getLineNumber(fileContent, match.index);
+      // For expressions, end_line is harder with regex. Often it's single line or needs balancing.
+      // For simplicity, we'll assume it's mostly single line or rely on the raw for full expression.
+      const endOfStatement = fileContent.indexOf(';', match.index);
+      const endOfLine = fileContent.indexOf('\n', match.index);
+      let statementEndIndex = match.index + match[0].length -1;
+      if (endOfStatement !== -1 && (endOfLine === -1 || endOfStatement < endOfLine)) {
+          statementEndIndex = endOfStatement;
+      } else if (endOfLine !== -1) {
+          // Heuristic for expression ending at line end if no semicolon
+          statementEndIndex = endOfLine;
+      }
+      // If it's a function or class declaration, findClosingBrace might be useful, but regex is simplified.
+      const endLine = getLineNumber(fileContent, statementEndIndex);
+
+      let localName = "anonymous_expression"; // Default for complex expressions
+      if (match[0].includes("function")) localName = match[2] || "anonymous_function";
+      else if (match[0].includes("class")) localName = match[3] || "anonymous_class";
+
+      exports.push({
+        raw: fileContent.substring(match.index, statementEndIndex + (fileContent[statementEndIndex] === ';' ? 1: 0) ),
+        type: "default_expression",
+        exported_items: [{ name: "default", local: localName }], // Simplified
+        source: null, start_line: startLine, end_line: endLine, filePath
+      });
+  }
+
+  while ((match = EXPORT_DECLARATION_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    // For declarations, end_line requires finding end of statement or block
+    // This is simplified; structure parsing will get more accurate end_lines for func/class
+    const endOfStatement = fileContent.indexOf(';', match.index);
+    const endOfLine = fileContent.indexOf('\n', match.index);
+    let statementEndIndex = match.index + match[0].length -1;
+     if (match[1] === 'function' || match[1] === 'class') {
+        const openBrace = fileContent.indexOf('{', match.index + match[0].length -1);
+        if(openBrace !== -1) {
+            const closeBrace = findClosingBrace(fileContent, openBrace);
+            statementEndIndex = closeBrace !== -1 ? closeBrace : statementEndIndex;
+        }
+    } else if (endOfStatement !== -1 && (endOfLine === -1 || endOfStatement < endOfLine)) {
+        statementEndIndex = endOfStatement;
+    } else if (endOfLine !== -1) {
+        statementEndIndex = endOfLine;
+    }
+
+    const endLine = getLineNumber(fileContent, statementEndIndex);
+    exports.push({
+      raw: fileContent.substring(match.index, statementEndIndex + (fileContent[statementEndIndex] === ';' ? 1: 0) ),
+      type: "declaration",
+      exported_items: [{ name: match[2], local: match[2] }],
+      source: null, start_line: startLine, end_line: endLine, filePath
+    });
+  }
+  while ((match = EXPORT_NAMED_LIST_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    exports.push({
+      raw: match[0],
+      type: match[3] ? "re-export_named" : "named_list",
+      exported_items: parseExportSpecifiers(match[1]),
+      source: match[3] || null,
+      start_line: startLine, end_line: endLine, filePath
+    });
+  }
+  while ((match = EXPORT_ALL_FROM_REGEX.exec(fileContent)) !== null) {
+    const startLine = getLineNumber(fileContent, match.index);
+    const endLine = getLineNumber(fileContent, match.index + match[0].length -1);
+    exports.push({
+      raw: match[0], type: "re-export_all",
+      exported_items: [{ name: "*", local: "*" }],
+      source: match[2], start_line: startLine, end_line: endLine, filePath
+    });
+  }
+
 
   // Pass 1: Top-level classes and their methods
   while ((match = CLASS_REGEX.exec(fileContent)) !== null) {
@@ -183,6 +396,11 @@ export function parseJavaScriptCode(fileContent, filePath) {
   // This might need refinement if top-level functions can look very similar to methods structurally.
   while ((match = FUNCTION_REGEX.exec(fileContent)) !== null) {
     // Crude check: if this match is inside an already found class, skip it.
+    // Also check if it's part of an export default function declaration that was already captured
+    const funcStartIndexCheck = match.index;
+    if (exports.some(e => e.raw.includes(match[0]) && e.raw.includes("export default function") && getLineNumber(fileContent, funcStartIndexCheck) === e.start_line)) {
+        continue;
+    }
     const funcStartIndex = match.index;
     let isInsideClass = false;
     for (const el of elements) {
@@ -229,5 +447,5 @@ export function parseJavaScriptCode(fileContent, filePath) {
     });
   }
 
-  return elements;
+  return { structures: elements, imports, exports };
 }
